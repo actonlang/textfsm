@@ -70,3 +70,13 @@ template = r"""..."""
 
 This avoids escaping issues around `$name`, `${name}`, and regex backslashes.
 
+## License and attribution
+
+This project is licensed under Apache License 2.0; see [LICENSE](LICENSE).
+
+The parser behavior and parts of the test corpus are derived from upstream
+Python TextFSM:
+
+- https://github.com/google/textfsm
+
+Upstream TextFSM is also licensed under Apache License 2.0.
