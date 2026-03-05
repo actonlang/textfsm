@@ -1,0 +1,727 @@
+import re
+
+class Error(Exception):
+    pass
+
+class UsageError(Error):
+    pass
+
+class TextFSMError(Error):
+    pass
+
+class TextFSMTemplateError(Error):
+    pass
+
+class ValueSpec(object):
+    name: str
+    regex: str
+    template: str
+    is_list: bool
+    required: bool
+    filldown: bool
+    fillup: bool
+    list_group_names: list[str]
+
+    def __init__(self, name: str, regex: str, template: str, is_list: bool, required: bool, filldown: bool, fillup: bool, list_group_names: list[str]):
+        self.name = name
+        self.regex = regex
+        self.template = template
+        self.is_list = is_list
+        self.required = required
+        self.filldown = filldown
+        self.fillup = fillup
+        self.list_group_names = list_group_names
+
+class FieldState(object):
+    texts: list[str]
+    records: list[dict[str, str]]
+
+    def __init__(self):
+        self.texts = []
+        self.records = []
+
+class Row(object):
+    vals: dict[str, list[str]]
+    recs: dict[str, list[dict[str, str]]]
+
+    def __init__(self, vals: dict[str, list[str]], recs: dict[str, list[dict[str, str]]]):
+        self.vals = vals
+        self.recs = recs
+
+    def one(self, field: str, default: str="") -> str:
+        values = self.vals[field]
+        if len(values) == 0:
+            return default
+        return values[0]
+
+    def many(self, field: str) -> list[str]:
+        values = self.vals[field]
+        copied: list[str] = []
+        for v in values:
+            copied.append(v)
+        return copied
+
+    def many_records(self, field: str) -> list[dict[str, str]]:
+        values = self.recs[field]
+        copied: list[dict[str, str]] = []
+        for item in values:
+            copied_item: dict[str, str] = {}
+            for key in item:
+                copied_item[key] = item[key]
+            copied.append(copied_item)
+        return copied
+
+    def to_dict(self) -> dict[str, list[str]]:
+        copied: dict[str, list[str]] = {}
+        for key in self.vals:
+            copied[key] = self.many(key)
+        return copied
+
+class TemplateRule(object):
+    pattern: str
+    captures: list[str]
+    line_action: str
+    record_action: str
+    target_state: ?str
+    error_message: ?str
+    line_num: int
+
+    def __init__(self, pattern: str, captures: list[str], line_action: str, record_action: str, target_state: ?str, error_message: ?str, line_num: int):
+        self.pattern = pattern
+        self.captures = captures
+        self.line_action = line_action
+        self.record_action = record_action
+        self.target_state = target_state
+        self.error_message = error_message
+        self.line_num = line_num
+
+_NAME_START_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+_NAME_CHARS = _NAME_START_CHARS + "0123456789"
+
+_LINE_ACTIONS = {"Next", "Continue", "Error"}
+_RECORD_ACTIONS = {"Record", "NoRecord", "Clear", "Clearall"}
+_RESERVED_STATE_NAMES = {"Next", "Continue", "Error", "Record", "NoRecord", "Clear", "Clearall"}
+_MAX_NAME_LEN = 48
+
+def _split_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for part in text.split(" "):
+        if part != "":
+            tokens.append(part)
+    return tokens
+
+def _is_comment_line(line: str) -> bool:
+    return line.strip().startswith("#")
+
+def _is_name_char(ch: str) -> bool:
+    return ch in _NAME_CHARS
+
+def _is_name_start_char(ch: str) -> bool:
+    return ch in _NAME_START_CHARS
+
+def _is_identifier(name: str) -> bool:
+    if len(name) == 0:
+        return False
+    if not _is_name_start_char(name[0]):
+        return False
+    for ch in name[1:]:
+        if not _is_name_char(ch):
+            return False
+    return True
+
+def _is_state_name(name: str) -> bool:
+    if len(name) == 0:
+        return False
+    for ch in name:
+        if not _is_name_char(ch):
+            return False
+    return True
+
+def _is_quoted(text: str) -> bool:
+    if len(text) < 2:
+        return False
+    return text.startswith("\"") and text.endswith("\"")
+
+def unwrap[T](v: ?T) -> T:
+    if v is not None:
+        return v
+    raise ValueError("Expected non-None value")
+
+def _validate_regex(pattern: str, line_no: int):
+    try:
+        m = re.match(pattern, "")
+    except ValueError:
+        raise TextFSMTemplateError("Invalid regular expression: '{pattern}'. Line: {line_no}.")
+
+def _extract_named_group_names(pattern: str) -> list[str]:
+    names: list[str] = []
+    i = 0
+    while i < len(pattern):
+        idx = pattern.find("(?P<", i)
+        if idx < 0:
+            break
+        start = idx + len("(?P<")
+        end = pattern.find(">", start)
+        if end < 0:
+            break
+        names.append(pattern[start:end])
+        i = end + 1
+    return names
+
+def _parse_value_line(line: str, line_no: int) -> ValueSpec:
+    if not line.startswith("Value "):
+        raise TextFSMTemplateError("Invalid Value line. Line: {line_no}.")
+
+    parts = _split_tokens(line)
+    if len(parts) < 3:
+        raise TextFSMTemplateError("Expect at least 3 tokens on line. Line: {line_no}.")
+
+    options_token = ""
+    name = ""
+    value_regex = ""
+
+    if not parts[2].startswith("("):
+        options_token = parts[1]
+        name = parts[2]
+        if len(parts) < 4:
+            raise TextFSMTemplateError("Value '{name}' must be contained within a '()' pair. Line: {line_no}.")
+        value_regex = parts[3]
+        for part in parts[4:]:
+            value_regex += " " + part
+    else:
+        name = parts[1]
+        value_regex = parts[2]
+        for part in parts[3:]:
+            value_regex += " " + part
+
+    if len(name) > _MAX_NAME_LEN or not _is_identifier(name):
+        raise TextFSMTemplateError("Invalid Value name '{name}' or name too long. Line: {line_no}.")
+
+    if len(value_regex) < 2:
+        raise TextFSMTemplateError("Value '{value_regex}' must be contained within a '()' pair. Line: {line_no}.")
+    if value_regex[0] != "(" or value_regex[len(value_regex) - 1] != ")":
+        raise TextFSMTemplateError("Value '{value_regex}' must be contained within a '()' pair. Line: {line_no}.")
+    if len(value_regex) >= 2 and value_regex[len(value_regex) - 2] == "\\":
+        raise TextFSMTemplateError("Value '{value_regex}' must be contained within a '()' pair. Line: {line_no}.")
+
+    _validate_regex(value_regex, line_no)
+
+    required = False
+    is_list = False
+    filldown = False
+    fillup = False
+
+    seen_options: set[str] = set()
+    if options_token != "":
+        for raw_opt in options_token.split(","):
+            opt = raw_opt.strip()
+            if opt == "":
+                raise TextFSMTemplateError("Unknown option '{opt}'. Line: {line_no}.")
+            if opt in seen_options:
+                raise TextFSMTemplateError("Duplicate option '{opt}'. Line: {line_no}.")
+            seen_options.add(opt)
+            if opt == "Required":
+                required = True
+            elif opt == "Filldown":
+                filldown = True
+            elif opt == "Fillup":
+                fillup = True
+            elif opt == "List":
+                is_list = True
+            elif opt == "Key":
+                raise NotImplementedError("Unsupported Value option: {opt}")
+            else:
+                raise TextFSMTemplateError("Unknown option '{opt}'. Line: {line_no}.")
+
+    value_template = "(?P<{name}>" + value_regex[1:]
+    list_group_names: list[str] = []
+    if is_list:
+        list_group_names = _extract_named_group_names(value_regex)
+
+    return ValueSpec(name, value_regex, value_template, is_list, required, filldown, fillup, list_group_names)
+
+def _expand_rule_pattern(rule_pattern: str, value_templates: dict[str, str], line_no: int) -> (str, list[str]):
+    expanded = ""
+    captures: list[str] = []
+    i: int = 0
+
+    while i < len(rule_pattern):
+        ch = rule_pattern[i]
+        if ch != "$":
+            expanded += ch
+            i += 1
+            continue
+
+        if i + 1 >= len(rule_pattern):
+            raise TextFSMTemplateError("Duplicate or invalid variable substitution: '{rule_pattern}'. Line: {line_no}.")
+
+        nxt = rule_pattern[i + 1]
+        if nxt == "$":
+            expanded += "$"
+            i += 2
+            continue
+
+        if nxt == r"{":
+            end = rule_pattern.find(r"}", i + 2)
+            if end < 0:
+                raise TextFSMTemplateError("Duplicate or invalid variable substitution: '{rule_pattern}'. Line: {line_no}.")
+            name = rule_pattern[i + 2:end]
+            if not _is_identifier(name) or name not in value_templates:
+                raise TextFSMTemplateError("Duplicate or invalid variable substitution: '{rule_pattern}'. Line: {line_no}.")
+            expanded += value_templates[name]
+            captures.append(name)
+            i = end + 1
+            continue
+
+        if _is_name_start_char(nxt):
+            j = i + 2
+            while j < len(rule_pattern) and _is_name_char(rule_pattern[j]):
+                j += 1
+            name = rule_pattern[i + 1:j]
+            if name not in value_templates:
+                raise TextFSMTemplateError("Duplicate or invalid variable substitution: '{rule_pattern}'. Line: {line_no}.")
+            expanded += value_templates[name]
+            captures.append(name)
+            i = j
+            continue
+
+        raise TextFSMTemplateError("Duplicate or invalid variable substitution: '{rule_pattern}'. Line: {line_no}.")
+
+    return (expanded, captures)
+
+def _bad_rule(rule_text: str, line_no: int):
+    raise TextFSMTemplateError("Badly formatted rule '{rule_text}'. Line: {line_no}.")
+
+def _split_action_tokens(action_text: str, rule_text: str, line_no: int) -> list[str]:
+    tokens: list[str] = []
+    i = 0
+    while i < len(action_text):
+        while i < len(action_text) and (action_text[i] == " " or action_text[i] == "\t"):
+            i += 1
+        if i >= len(action_text):
+            break
+
+        if action_text[i] == "\"":
+            j = i + 1
+            while j < len(action_text) and action_text[j] != "\"":
+                j += 1
+            if j >= len(action_text):
+                _bad_rule(rule_text, line_no)
+            tokens.append(action_text[i:j + 1])
+            i = j + 1
+            continue
+
+        j = i
+        while j < len(action_text) and action_text[j] != " " and action_text[j] != "\t":
+            j += 1
+        tokens.append(action_text[i:j])
+        i = j
+
+    return tokens
+
+def _parse_rule_action(action_text: str, rule_text: str, line_no: int) -> (str, str, ?str, ?str):
+    if action_text == "":
+        return ("Next", "NoRecord", None, None)
+
+    tokens = _split_action_tokens(action_text, rule_text, line_no)
+    if len(tokens) == 0 or len(tokens) > 2:
+        _bad_rule(rule_text, line_no)
+
+    control = tokens[0]
+    destination: ?str = None
+    if len(tokens) == 2:
+        destination = tokens[1]
+
+    line_action = "Next"
+    record_action = "NoRecord"
+    target_state: ?str = None
+    error_message: ?str = None
+
+    state_only = False
+
+    dot_parts = control.split(".")
+    if len(dot_parts) == 2:
+        left = dot_parts[0]
+        right = dot_parts[1]
+        if left == "" or right == "":
+            _bad_rule(rule_text, line_no)
+        if left in _LINE_ACTIONS and right in _RECORD_ACTIONS:
+            line_action = left
+            record_action = right
+        else:
+            _bad_rule(rule_text, line_no)
+    elif len(dot_parts) > 2:
+        _bad_rule(rule_text, line_no)
+    else:
+        if control in _LINE_ACTIONS:
+            line_action = control
+            record_action = "NoRecord"
+        elif control in _RECORD_ACTIONS:
+            line_action = "Next"
+            record_action = control
+        else:
+            state_only = True
+            line_action = "Next"
+            record_action = "NoRecord"
+            target_state = control
+
+    if destination is not None:
+        if state_only:
+            _bad_rule(rule_text, line_no)
+        target_state = destination
+
+    if line_action == "Continue" and target_state is not None:
+        raise TextFSMTemplateError("Action '{line_action}' with new state {target_state} specified. Line: {line_no}.")
+
+    if line_action == "Error":
+        if target_state is not None:
+            error_message = target_state
+            target_state = None
+    elif target_state is not None:
+        if _is_quoted(target_state) or not _is_state_name(target_state):
+            raise TextFSMTemplateError("Alphanumeric characters only in state names. Line: {line_no}.")
+
+    return (line_action, record_action, target_state, error_message)
+
+def _parse_rule_line(line: str, line_no: int, value_templates: dict[str, str]) -> TemplateRule:
+    stripped = line.strip()
+    if stripped == "":
+        raise TextFSMTemplateError("Null data in FSMRule. Line: {line_no}.")
+
+    arrow_pos = stripped.rfind(" ->")
+    rule_pattern = stripped
+    action_text = ""
+    if arrow_pos >= 0:
+        rule_pattern = stripped[:arrow_pos]
+        action_text = stripped[arrow_pos + len(" ->"):].strip()
+
+    expanded_pattern, captures = _expand_rule_pattern(rule_pattern, value_templates, line_no)
+    _validate_regex(expanded_pattern, line_no)
+    line_action, record_action, target_state, error_message = _parse_rule_action(action_text, stripped, line_no)
+
+    return TemplateRule(expanded_pattern, captures, line_action, record_action, target_state, error_message, line_no)
+
+def _parse_template(template: str) -> (list[ValueSpec], dict[str, list[TemplateRule]]):
+    if template == "":
+        raise TextFSMTemplateError("Null template.")
+
+    value_specs: list[ValueSpec] = []
+    value_templates: dict[str, str] = {}
+    rules_by_state: dict[str, list[TemplateRule]] = {}
+
+    lines = template.splitlines()
+    i = 0
+
+    while i < len(lines):
+        raw = lines[i].rstrip()
+        stripped = raw.strip()
+        line_no = i + 1
+
+        if stripped == "":
+            i += 1
+            break
+
+        if _is_comment_line(raw):
+            i += 1
+            continue
+
+        if raw.startswith("Value "):
+            value_spec = _parse_value_line(raw, line_no)
+            if value_spec.name in value_templates:
+                raise TextFSMTemplateError("Duplicate declarations for Value '{value_spec.name}'. Line: {line_no}.")
+            value_specs.append(value_spec)
+            value_templates[value_spec.name] = value_spec.template
+            i += 1
+            continue
+
+        if len(value_specs) == 0:
+            raise TextFSMTemplateError("No Value definitions found.")
+        raise TextFSMTemplateError("Expected blank line after last Value entry. Line: {line_no}.")
+
+    if len(value_specs) == 0:
+        raise TextFSMTemplateError("No Value definitions found.")
+
+    while i < len(lines):
+        while i < len(lines):
+            raw = lines[i].rstrip()
+            stripped = raw.strip()
+            if stripped == "" or _is_comment_line(raw):
+                i += 1
+                continue
+            break
+
+        if i >= len(lines):
+            break
+
+        state_raw = lines[i].rstrip()
+        state_name = state_raw.strip()
+        line_no = i + 1
+
+        if not _is_state_name(state_name) or len(state_name) > _MAX_NAME_LEN or state_name in _RESERVED_STATE_NAMES:
+            raise TextFSMTemplateError("Invalid state name: '{state_name}'. Line: {line_no}")
+
+        if state_name in rules_by_state:
+            raise TextFSMTemplateError("Duplicate state name: '{state_name}'. Line: {line_no}")
+
+        rules_by_state[state_name] = []
+        i += 1
+
+        while i < len(lines):
+            rule_raw = lines[i].rstrip()
+            rule_stripped = rule_raw.strip()
+            rule_line_no = i + 1
+
+            if rule_stripped == "":
+                i += 1
+                break
+
+            if _is_comment_line(rule_raw):
+                i += 1
+                continue
+
+            if not (rule_raw.startswith(" ^") or rule_raw.startswith("  ^") or rule_raw.startswith("\t^")):
+                raise TextFSMTemplateError("Missing white space or carat ('^') before rule. Line: {rule_line_no}")
+
+            rules_by_state[state_name].append(_parse_rule_line(rule_raw, rule_line_no, value_templates))
+            i += 1
+
+    if "Start" not in rules_by_state:
+        raise TextFSMTemplateError("Missing state 'Start'.")
+
+    if "End" in rules_by_state and len(rules_by_state["End"]) > 0:
+        raise TextFSMTemplateError("Non-Empty 'End' state.")
+    if "EOF" in rules_by_state and len(rules_by_state["EOF"]) > 0:
+        raise TextFSMTemplateError("Non-Empty 'EOF' state.")
+
+    if "End" in rules_by_state:
+        del rules_by_state["End"]
+
+    for state_name in rules_by_state:
+        for rule in rules_by_state[state_name]:
+            target_state_opt = rule.target_state
+            if target_state_opt is None:
+                continue
+            target_state = unwrap(target_state_opt)
+            if target_state == "End" or target_state == "EOF":
+                continue
+            if target_state not in rules_by_state:
+                raise TextFSMTemplateError("State '{target_state}' not found, referenced in state '{state_name}'")
+
+    return (value_specs, rules_by_state)
+
+def _copy_strings(values: list[str]) -> list[str]:
+    copied: list[str] = []
+    for v in values:
+        copied.append(v)
+    return copied
+
+def _copy_record_dicts(values: list[dict[str, str]]) -> list[dict[str, str]]:
+    copied: list[dict[str, str]] = []
+    for item in values:
+        copied_item: dict[str, str] = {}
+        for key in item:
+            copied_item[key] = item[key]
+        copied.append(copied_item)
+    return copied
+
+def _build_empty_record(value_specs: list[ValueSpec]) -> dict[str, FieldState]:
+    record: dict[str, FieldState] = {}
+    for spec in value_specs:
+        record[spec.name] = FieldState()
+    return record
+
+def _field_has_value_for_required(field: FieldState, spec: ValueSpec) -> bool:
+    if spec.is_list:
+        return len(field.texts) > 0 or len(field.records) > 0
+
+    if len(field.texts) == 0:
+        return False
+    return field.texts[0] != ""
+
+def _required_values_present(record: dict[str, FieldState], value_specs: list[ValueSpec]) -> bool:
+    for spec in value_specs:
+        if spec.required and not _field_has_value_for_required(record[spec.name], spec):
+            return False
+    return True
+
+def _record_is_empty(record: dict[str, FieldState], value_specs: list[ValueSpec]) -> bool:
+    for spec in value_specs:
+        field = record[spec.name]
+        if spec.is_list:
+            if len(field.texts) > 0 or len(field.records) > 0:
+                return False
+        else:
+            if len(field.texts) > 0:
+                return False
+    return True
+
+def _clear_non_filldown(record: dict[str, FieldState], value_specs: list[ValueSpec]):
+    for spec in value_specs:
+        if not spec.filldown:
+            record[spec.name].texts = []
+            record[spec.name].records = []
+
+def _clear_all(record: dict[str, FieldState], value_specs: list[ValueSpec]):
+    for spec in value_specs:
+        record[spec.name].texts = []
+        record[spec.name].records = []
+
+def _append_record(rows: list[Row], record: dict[str, FieldState], value_specs: list[ValueSpec]):
+    if not _required_values_present(record, value_specs):
+        _clear_non_filldown(record, value_specs)
+        return
+
+    if _record_is_empty(record, value_specs):
+        return
+
+    vals: dict[str, list[str]] = {}
+    recs: dict[str, list[dict[str, str]]] = {}
+    for spec in value_specs:
+        field = record[spec.name]
+        vals[spec.name] = _copy_strings(field.texts)
+        recs[spec.name] = _copy_record_dicts(field.records)
+    rows.append(Row(vals, recs))
+    _clear_non_filldown(record, value_specs)
+
+def _field_has_value_for_fillup(row: Row, spec: ValueSpec) -> bool:
+    if spec.is_list:
+        return len(row.vals[spec.name]) > 0 or len(row.recs[spec.name]) > 0
+
+    values = row.vals[spec.name]
+    if len(values) == 0:
+        return False
+    return values[0] != ""
+
+def _apply_fillup(rows: list[Row], value_specs: list[ValueSpec]):
+    for spec in value_specs:
+        if not spec.fillup:
+            continue
+
+        carry_vals: list[str] = []
+        carry_recs: list[dict[str, str]] = []
+        have_carry = False
+        idx = len(rows) - 1
+        while idx >= 0:
+            row = rows[idx]
+            if _field_has_value_for_fillup(row, spec):
+                carry_vals = _copy_strings(row.vals[spec.name])
+                carry_recs = _copy_record_dicts(row.recs[spec.name])
+                have_carry = True
+            elif have_carry:
+                row.vals[spec.name] = _copy_strings(carry_vals)
+                row.recs[spec.name] = _copy_record_dicts(carry_recs)
+            idx -= 1
+
+def _value_specs_by_name(value_specs: list[ValueSpec]) -> dict[str, ValueSpec]:
+    by_name: dict[str, ValueSpec] = {}
+    for spec in value_specs:
+        by_name[spec.name] = spec
+    return by_name
+
+def _execute_rules_for_line(
+    line: str,
+    state_rules: list[TemplateRule],
+    value_specs: list[ValueSpec],
+    value_specs_by_name: dict[str, ValueSpec],
+    current_record: dict[str, FieldState],
+    current_state: str,
+    rows: list[Row]
+) -> str:
+    rule_idx = 0
+    while rule_idx < len(state_rules):
+        rule = state_rules[rule_idx]
+        m = re.match(rule.pattern, line)
+        if m is None:
+            rule_idx += 1
+            continue
+        match_obj = unwrap(m)
+
+        for name in rule.captures:
+            captured_opt = match_obj.named[name]
+            if captured_opt is None:
+                continue
+            captured = unwrap(captured_opt)
+
+            spec = value_specs_by_name[name]
+            field = current_record[name]
+            if spec.is_list:
+                if len(spec.list_group_names) > 0:
+                    nested = re.match(spec.regex, captured)
+                    if nested is not None:
+                        nested_match = unwrap(nested)
+                        item: dict[str, str] = {}
+                        for gname in spec.list_group_names:
+                            gvalue = nested_match.named[gname]
+                            if gvalue is None:
+                                item[gname] = ""
+                            else:
+                                item[gname] = unwrap(gvalue)
+                        field.records.append(item)
+                    else:
+                        field.texts.append(captured)
+                else:
+                    field.texts.append(captured)
+            else:
+                field.texts = [captured]
+                field.records = []
+
+        if rule.record_action == "Record":
+            _append_record(rows, current_record, value_specs)
+        elif rule.record_action == "Clear":
+            _clear_non_filldown(current_record, value_specs)
+        elif rule.record_action == "Clearall":
+            _clear_all(current_record, value_specs)
+
+        if rule.line_action == "Error":
+            if rule.error_message is None:
+                raise TextFSMError("State Error raised. Rule Line: {rule.line_num}. Input Line: {line}")
+            raise TextFSMError("Error: {rule.error_message}. Rule Line: {rule.line_num}. Input Line: {line}.")
+
+        if rule.line_action == "Continue":
+            rule_idx += 1
+            continue
+
+        if rule.target_state is not None:
+            current_state = unwrap(rule.target_state)
+        break
+
+    return current_state
+
+class CompiledTemplate(object):
+    value_specs: list[ValueSpec]
+    rules_by_state: dict[str, list[TemplateRule]]
+    header: list[str]
+
+    def __init__(self, template: str):
+        parsed = _parse_template(template)
+        self.value_specs = parsed.0
+        self.rules_by_state = parsed.1
+        self.header = []
+        for spec in self.value_specs:
+            self.header.append(spec.name)
+
+    def parse(self, text: str, eof: bool=True) -> list[Row]:
+        rows: list[Row] = []
+        value_specs_by_name = _value_specs_by_name(self.value_specs)
+        current_record = _build_empty_record(self.value_specs)
+        current_state = "Start"
+
+        for line in text.splitlines():
+            if current_state == "End" or current_state == "EOF":
+                break
+            state_rules = self.rules_by_state[current_state]
+            current_state = _execute_rules_for_line(line, state_rules, self.value_specs, value_specs_by_name, current_record, current_state, rows)
+            if current_state == "End" or current_state == "EOF":
+                break
+
+        if current_state != "End" and "EOF" not in self.rules_by_state and eof:
+            _append_record(rows, current_record, self.value_specs)
+
+        _apply_fillup(rows, self.value_specs)
+        return rows
+
+def compile_textfsm(template: str) -> CompiledTemplate:
+    return CompiledTemplate(template)
+
+def parse_textfsm(template: str, text: str, eof: bool=True) -> list[Row]:
+    return compile_textfsm(template).parse(text, eof)

@@ -1,0 +1,486 @@
+import testing
+from textfsm import parse_textfsm, compile_textfsm, Row, TextFSMError, TextFSMTemplateError
+
+def _rows_as_scalars(rows: list[Row], fields: list[str]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for row in rows:
+        item: dict[str, str] = {}
+        for field in fields:
+            item[field] = row.one(field)
+        out.append(item)
+    return out
+
+def _rows_as_lists(rows: list[Row]) -> list[dict[str, list[str]]]:
+    out: list[dict[str, list[str]]] = []
+    for row in rows:
+        out.append(row.to_dict())
+    return out
+
+def _test_parse_interface_status_table():
+    template = r"""Value Required INTERFACE (\S+)
+Value STATUS (up|down)
+Value PROTOCOL (up|down)
+
+Start
+  ^${INTERFACE}\s+${STATUS}\s+${PROTOCOL} -> Record
+"""
+    text = """GigabitEthernet0/0 up up
+GigabitEthernet0/1 down down
+"""
+    expected: list[dict[str, str]] = [
+        {"INTERFACE": "GigabitEthernet0/0", "STATUS": "up", "PROTOCOL": "up"},
+        {"INTERFACE": "GigabitEthernet0/1", "STATUS": "down", "PROTOCOL": "down"},
+    ]
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(_rows_as_scalars(rows, ["INTERFACE", "STATUS", "PROTOCOL"]), expected)
+
+def _test_parse_filldown_persists_last_value():
+    template = r"""Value Filldown DEVICE (\S+)
+Value IFACE (\S+)
+Value STATUS (up|down)
+
+Start
+  ^${DEVICE}\s+${IFACE}\s+${STATUS} -> Record
+  ^\s+${IFACE}\s+${STATUS} -> Record
+"""
+    text = """router1 ge-0/0 up
+ ge-0/1 down
+router2 ge-0/0 up
+ ge-0/1 up
+"""
+    expected: list[dict[str, str]] = [
+        {"DEVICE": "router1", "IFACE": "ge-0/0", "STATUS": "up"},
+        {"DEVICE": "router1", "IFACE": "ge-0/1", "STATUS": "down"},
+        {"DEVICE": "router2", "IFACE": "ge-0/0", "STATUS": "up"},
+        {"DEVICE": "router2", "IFACE": "ge-0/1", "STATUS": "up"},
+        {"DEVICE": "router2", "IFACE": "", "STATUS": ""},
+    ]
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(_rows_as_scalars(rows, ["DEVICE", "IFACE", "STATUS"]), expected)
+
+def _test_parse_state_transitions():
+    template = r"""Value Filldown HOST (\S+)
+Value IFACE (\S+)
+Value STATUS (up|down)
+
+Start
+  ^Device:\s+${HOST} -> IFACES
+
+IFACES
+  ^\s+${IFACE}\s+${STATUS} -> Record
+  ^Device:\s+${HOST} -> IFACES
+"""
+    text = """Device: r1
+ ge0 up
+ ge1 down
+Device: r2
+ ge0 up
+"""
+    expected: list[dict[str, str]] = [
+        {"HOST": "r1", "IFACE": "ge0", "STATUS": "up"},
+        {"HOST": "r1", "IFACE": "ge1", "STATUS": "down"},
+        {"HOST": "r2", "IFACE": "ge0", "STATUS": "up"},
+        {"HOST": "r2", "IFACE": "", "STATUS": ""},
+    ]
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(_rows_as_scalars(rows, ["HOST", "IFACE", "STATUS"]), expected)
+
+def _test_parse_clear_and_clearall():
+    template = r"""Value Filldown HOST (\S+)
+Value ITEM (\S+)
+
+Start
+  ^Device:\s+${HOST} -> NoRecord
+  ^Item:\s+${ITEM} -> NoRecord
+  ^CLEAR -> Clear
+  ^Emit1 -> Record
+  ^RESET -> Clearall
+  ^Emit2 -> Record
+"""
+    text = """Device: r1
+Item: a
+CLEAR
+Emit1
+RESET
+Emit2
+"""
+    expected: list[dict[str, str]] = [
+        {"HOST": "r1", "ITEM": ""},
+    ]
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(_rows_as_scalars(rows, ["HOST", "ITEM"]), expected)
+
+def _test_parse_continue_directive():
+    template = r"""Value IFACE (\S+)
+Value STATUS (up|down)
+
+Start
+  ^if=${IFACE}\s+state=\S+ -> Continue
+  ^if=\S+\s+state=${STATUS} -> Record
+"""
+    text = """if=ge0 state=up
+if=ge1 state=down
+"""
+    expected: list[dict[str, str]] = [
+        {"IFACE": "ge0", "STATUS": "up"},
+        {"IFACE": "ge1", "STATUS": "down"},
+    ]
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(_rows_as_scalars(rows, ["IFACE", "STATUS"]), expected)
+
+def _test_parse_error_action_raises_textfsmerror():
+    template = r"""Value MSG (\S+)
+
+Start
+  ^ERROR:\s+${MSG} -> Error
+  ^OK:\s+${MSG} -> Record
+"""
+    text = """ERROR: boom
+"""
+    try:
+        parse_textfsm(template, text)
+        testing.error("Expected TextFSMError but parse_textfsm succeeded")
+    except TextFSMError:
+        pass
+
+def _test_parse_error_action_with_message_raises_textfsmerror():
+    template = r"""Value MSG (\S+)
+
+Start
+  ^ERROR:\s+${MSG} -> Error \"boom\"
+  ^OK:\s+${MSG} -> Record
+"""
+    text = """ERROR: boom
+"""
+    try:
+        parse_textfsm(template, text)
+        testing.error("Expected TextFSMError but parse_textfsm succeeded")
+    except TextFSMError:
+        pass
+
+def _test_parse_value_option_key_unsupported():
+    template = r"""Value Key NAME (\S+)
+
+Start
+  ^${NAME} -> Record
+"""
+    text = """alice
+"""
+    try:
+        parse_textfsm(template, text)
+        testing.error("Expected NotImplementedError but parse_textfsm succeeded")
+    except NotImplementedError:
+        pass
+
+def _test_parse_value_list_collects_entries():
+    template = r"""Value HOST (\S+)
+Value List NEIGHBOR (\S+)
+
+Start
+  ^Host:\s+${HOST} -> NoRecord
+  ^Neighbor:\s+${NEIGHBOR} -> NoRecord
+  ^Done -> Record
+"""
+    text = """Host: r1
+Neighbor: 10.0.0.1
+Neighbor: 10.0.0.2
+Done
+Host: r2
+Neighbor: 192.0.2.1
+Done
+"""
+    rows = parse_textfsm(template, text)
+    expected: list[dict[str, list[str]]] = [
+        {"HOST": ["r1"], "NEIGHBOR": ["10.0.0.1", "10.0.0.2"]},
+        {"HOST": ["r2"], "NEIGHBOR": ["192.0.2.1"]},
+    ]
+    testing.assertEqual(_rows_as_lists(rows), expected)
+
+def _test_parse_value_list_filldown_accumulates():
+    template = r"""Value List,Filldown BOO (on.)
+Value HOO (on.)
+
+Start
+  ^$BOO -> Continue
+  ^$HOO -> Next.Record
+
+EOF
+"""
+    text = """one
+on0
+on1
+"""
+    rows = parse_textfsm(template, text)
+    expected: list[dict[str, list[str]]] = [
+        {"BOO": ["one"], "HOO": ["one"]},
+        {"BOO": ["one", "on0"], "HOO": ["on0"]},
+        {"BOO": ["one", "on0", "on1"], "HOO": ["on1"]},
+    ]
+    testing.assertEqual(_rows_as_lists(rows), expected)
+
+def _test_parse_value_list_nested_named_groups():
+    template = r"""Value List FOO ((?P<name>\w+):\s+(?P<age>\d+))
+Value NAME (^\w+$)
+
+Start
+  ^\s*${FOO}
+  ^\s*${NAME}
+  ^\s*$$ -> Record
+"""
+    text = """Bob: 32
+Alice: 27
+Julia
+
+"""
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(rows[0].many_records("FOO"), [
+        {"name": "Bob", "age": "32"},
+        {"name": "Alice", "age": "27"},
+    ])
+    testing.assertEqual(rows[0].one("NAME"), "Julia")
+
+def _test_parse_dollar_name_substitution_and_escaped_dollar():
+    template = r"""Value AMOUNT (\d+)
+
+Start
+  ^cost:\s+\$$$AMOUNT -> Record
+"""
+    text = """cost: $42
+"""
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(rows[0].one("AMOUNT"), "42")
+
+def _test_parse_captures_with_inner_groups_do_not_shift_other_values():
+    template = r"""Value A ((\d+)-(\d+))
+Value B (\S+)
+
+Start
+  ^${A}\s+${B} -> Record
+"""
+    text = """12-34 hello
+"""
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(rows[0].one("A"), "12-34")
+    testing.assertEqual(rows[0].one("B"), "hello")
+
+def _test_parse_implicit_eof_record():
+    template = r"""Value BOO (.*)
+
+Start
+  ^$BOO -> Next
+"""
+    rows = parse_textfsm(template, "Matching text")
+    testing.assertEqual(rows[0].one("BOO"), "Matching text")
+
+def _test_parse_explicit_eof_suppresses_implicit_record():
+    template = r"""Value BOO (.*)
+
+Start
+  ^$BOO -> Next
+
+EOF
+"""
+    rows = parse_textfsm(template, "Matching text")
+    testing.assertEqual(len(rows), 0)
+
+def _test_parse_eof_argument_false_suppresses_implicit_record():
+    template = r"""Value BOO (.*)
+
+Start
+  ^$BOO -> Next
+"""
+    rows = parse_textfsm(template, "Matching text", eof=False)
+    testing.assertEqual(len(rows), 0)
+
+def _test_parse_end_state_stops_and_skips_eof_record():
+    template = r"""Value BOO (.*)
+
+Start
+  ^$BOO -> End
+  ^$BOO -> Record
+"""
+    text = """Matching text A
+Matching text B
+"""
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(len(rows), 0)
+
+def _test_parse_record_end_records_once_and_stops():
+    template = r"""Value BOO (.*)
+
+Start
+  ^$BOO -> Record End
+"""
+    text = """Matching text A
+Matching text B
+"""
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(len(rows), 1)
+    testing.assertEqual(rows[0].one("BOO"), "Matching text A")
+
+def _test_parse_transition_to_eof_without_eof_state_records_once():
+    template = r"""Value BOO (.*)
+
+Start
+  ^$BOO -> EOF
+  ^$BOO -> Record
+"""
+    text = """Matching text A
+Matching text B
+"""
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(len(rows), 1)
+    testing.assertEqual(rows[0].one("BOO"), "Matching text A")
+
+def _test_parse_fillup_option():
+    template = r"""Value Required Col1 ([^-]+)
+Value Fillup Col2 ([^-]+)
+Value Fillup Col3 ([^-]+)
+
+Start
+  ^$Col1 -- -- -> Record
+  ^$Col1 $Col2 -- -> Record
+  ^$Col1 -- $Col3 -> Record
+  ^$Col1 $Col2 $Col3 -> Record
+"""
+    text = """
+1 -- B1
+2 A2 --
+3 -- B3
+"""
+    expected: list[dict[str, str]] = [
+        {"Col1": "1", "Col2": "A2", "Col3": "B1"},
+        {"Col1": "2", "Col2": "A2", "Col3": "B3"},
+        {"Col1": "3", "Col2": "", "Col3": "B3"},
+    ]
+    rows = parse_textfsm(template, text)
+    testing.assertEqual(_rows_as_scalars(rows, ["Col1", "Col2", "Col3"]), expected)
+
+def _test_compiled_template_is_reusable_without_hidden_parser_state():
+    template = r"""Value X (\S+)
+
+Start
+  ^$X -> Record
+"""
+    compiled = compile_textfsm(template)
+    rows1 = compiled.parse("a\n")
+    rows2 = compiled.parse("b\n")
+    testing.assertEqual(rows1[0].one("X"), "a")
+    testing.assertEqual(rows2[0].one("X"), "b")
+
+def _test_template_error_continue_with_destination():
+    template = r"""Value X (\S+)
+
+Start
+  ^$X -> Continue Start
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
+
+def _test_template_error_missing_start_state():
+    template = r"""Value X (\S+)
+
+NotStart
+  ^$X -> Record
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
+
+def _test_template_error_duplicate_value_declaration():
+    template = r"""Value X (\S+)
+Value X (\S+)
+
+Start
+  ^$X -> Record
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
+
+def _test_template_error_duplicate_state_name():
+    template = r"""Value X (\S+)
+
+Start
+  ^$X -> Record
+
+Start
+  ^$X -> Record
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
+
+def _test_template_error_missing_rule_prefix():
+    template = r"""Value X (\S+)
+
+Start
+^$X -> Record
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
+
+def _test_template_error_missing_blank_line_after_values():
+    template = r"""Value X (\S+)
+Start
+  ^$X -> Record
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
+
+def _test_template_error_non_empty_end_state():
+    template = r"""Value X (\S+)
+
+Start
+  ^$X -> Record
+
+End
+  ^$X -> Record
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
+
+def _test_template_error_non_empty_eof_state():
+    template = r"""Value X (\S+)
+
+Start
+  ^$X -> Record
+
+EOF
+  ^$X -> Record
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
+
+def _test_template_error_unknown_state_reference():
+    template = r"""Value X (\S+)
+
+Start
+  ^$X -> UnknownState
+"""
+    try:
+        parse_textfsm(template, "a\n")
+        testing.error("Expected TextFSMTemplateError but parse_textfsm succeeded")
+    except TextFSMTemplateError:
+        pass
