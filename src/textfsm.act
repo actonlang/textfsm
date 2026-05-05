@@ -48,7 +48,13 @@ class Row(object):
         self.vals = vals
         self.recs = recs
 
-    def one(self, field: str, default: str="") -> str:
+    def get(self, field: str) -> ?str:
+        values = self.vals[field]
+        if len(values) == 0:
+            return None
+        return values[0]
+
+    def get_def(self, field: str, default: str) -> str:
         values = self.vals[field]
         if len(values) == 0:
             return default

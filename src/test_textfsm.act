@@ -6,7 +6,7 @@ def _rows_as_scalars(rows: list[Row], fields: list[str]) -> list[dict[str, str]]
     for row in rows:
         item: dict[str, str] = {}
         for field in fields:
-            item[field] = row.one(field)
+            item[field] = row.get_def(field, "")
         out.append(item)
     return out
 
@@ -237,7 +237,7 @@ Julia
         {"name": "Bob", "age": "32"},
         {"name": "Alice", "age": "27"},
     ])
-    testing.assertEqual(rows[0].one("NAME"), "Julia")
+    testing.assertEqual(rows[0].get_def("NAME", ""), "Julia")
 
 def _test_parse_dollar_name_substitution_and_escaped_dollar():
     template = r"""Value AMOUNT (\d+)
@@ -248,7 +248,7 @@ Start
     text = """cost: $42
 """
     rows = parse_textfsm(template, text)
-    testing.assertEqual(rows[0].one("AMOUNT"), "42")
+    testing.assertEqual(rows[0].get_def("AMOUNT", ""), "42")
 
 def _test_parse_captures_with_inner_groups_do_not_shift_other_values():
     template = r"""Value A ((\d+)-(\d+))
@@ -260,8 +260,24 @@ Start
     text = """12-34 hello
 """
     rows = parse_textfsm(template, text)
-    testing.assertEqual(rows[0].one("A"), "12-34")
-    testing.assertEqual(rows[0].one("B"), "hello")
+    testing.assertEqual(rows[0].get_def("A", ""), "12-34")
+    testing.assertEqual(rows[0].get_def("B", ""), "hello")
+
+def _test_row_get_distinguishes_missing_from_empty_capture():
+    template = r"""Value EMPTY (.*)
+Value MISSING (\S+)
+
+Start
+  ^empty:${EMPTY} -> Record
+"""
+    rows = parse_textfsm(template, "empty:\n")
+    empty = rows[0].get("EMPTY")
+    if empty is None:
+        testing.error("Expected EMPTY to capture an empty string")
+    if rows[0].get("MISSING") is not None:
+        testing.error("Expected MISSING to have no capture")
+    testing.assertEqual(rows[0].get_def("EMPTY", "fallback"), "")
+    testing.assertEqual(rows[0].get_def("MISSING", "fallback"), "fallback")
 
 def _test_parse_implicit_eof_record():
     template = r"""Value BOO (.*)
@@ -270,7 +286,7 @@ Start
   ^$BOO -> Next
 """
     rows = parse_textfsm(template, "Matching text")
-    testing.assertEqual(rows[0].one("BOO"), "Matching text")
+    testing.assertEqual(rows[0].get_def("BOO", ""), "Matching text")
 
 def _test_parse_explicit_eof_suppresses_implicit_record():
     template = r"""Value BOO (.*)
@@ -316,7 +332,7 @@ Matching text B
 """
     rows = parse_textfsm(template, text)
     testing.assertEqual(len(rows), 1)
-    testing.assertEqual(rows[0].one("BOO"), "Matching text A")
+    testing.assertEqual(rows[0].get_def("BOO", ""), "Matching text A")
 
 def _test_parse_transition_to_eof_without_eof_state_records_once():
     template = r"""Value BOO (.*)
@@ -330,7 +346,7 @@ Matching text B
 """
     rows = parse_textfsm(template, text)
     testing.assertEqual(len(rows), 1)
-    testing.assertEqual(rows[0].one("BOO"), "Matching text A")
+    testing.assertEqual(rows[0].get_def("BOO", ""), "Matching text A")
 
 def _test_parse_fillup_option():
     template = r"""Value Required Col1 ([^-]+)
@@ -365,8 +381,8 @@ Start
     compiled = compile_textfsm(template)
     rows1 = compiled.parse("a\n")
     rows2 = compiled.parse("b\n")
-    testing.assertEqual(rows1[0].one("X"), "a")
-    testing.assertEqual(rows2[0].one("X"), "b")
+    testing.assertEqual(rows1[0].get_def("X", ""), "a")
+    testing.assertEqual(rows2[0].get_def("X", ""), "b")
 
 def _test_template_error_continue_with_destination():
     template = r"""Value X (\S+)

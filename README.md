@@ -20,11 +20,11 @@ Start
 """
     rows = parse_textfsm(template, "ge0 up\nge1 down\n")
     for row in rows:
-        print(row.one("IFACE"), row.one("STATUS"))
+        print(row.get("IFACE"), row.get("STATUS"))
 
     compiled = compile_textfsm(template)
     rows2 = compiled.parse("ge2 up\n")
-    print(rows2[0].one("IFACE"))
+    print(rows2[0].get("IFACE"))
 ```
 
 ## Public API
@@ -32,10 +32,14 @@ Start
 - `parse_textfsm(template: str, text: str, eof: bool=True) -> list[Row]`
 - `compile_textfsm(template: str) -> CompiledTemplate`
 - `CompiledTemplate.parse(text: str, eof: bool=True) -> list[Row]`
-- `Row.one(field: str, default: str="") -> str`
+- `Row.get(field: str) -> ?str`
+- `Row.get_def(field: str, default: str) -> str`
 - `Row.many(field: str) -> list[str]`
 - `Row.many_records(field: str) -> list[dict[str, str]]` (for nested named groups in `Value List`)
 - `Row.to_dict() -> dict[str, list[str]]`
+
+`Row.get()` returns `None` when a field has no capture. A field that
+captures an empty string returns `""`.
 
 ## Exceptions
 
