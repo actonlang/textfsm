@@ -32,6 +32,24 @@ class ValueSpec(object):
         self.fillup = fillup
         self.list_group_names = list_group_names
 
+class FieldSchema(object):
+    name: str
+    regex: str
+    is_list: bool
+    required: bool
+    filldown: bool
+    fillup: bool
+    record_fields: list[str]
+
+    def __init__(self, name: str, regex: str, is_list: bool, required: bool, filldown: bool, fillup: bool, record_fields: list[str]):
+        self.name = name
+        self.regex = regex
+        self.is_list = is_list
+        self.required = required
+        self.filldown = filldown
+        self.fillup = fillup
+        self.record_fields = record_fields
+
 class FieldState(object):
     texts: list[str]
     records: list[dict[str, str]]
@@ -705,6 +723,16 @@ class CompiledTemplate(object):
         self.header = []
         for spec in self.value_specs:
             self.header.append(spec.name)
+
+    def schema(self) -> list[FieldSchema]:
+        fields: list[FieldSchema] = []
+        for spec in self.value_specs:
+            record_fields: list[str] = []
+            for name in spec.list_group_names:
+                record_fields.append(name)
+
+            fields.append(FieldSchema(spec.name, spec.regex, spec.is_list, spec.required, spec.filldown, spec.fillup, record_fields))
+        return fields
 
     def parse(self, text: str, eof: bool=True) -> list[Row]:
         rows: list[Row] = []

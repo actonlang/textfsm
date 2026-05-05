@@ -32,6 +32,7 @@ Start
 - `parse_textfsm(template: str, text: str, eof: bool=True) -> list[Row]`
 - `compile_textfsm(template: str) -> CompiledTemplate`
 - `CompiledTemplate.parse(text: str, eof: bool=True) -> list[Row]`
+- `CompiledTemplate.schema() -> list[FieldSchema]`
 - `Row.get(field: str) -> ?str`
 - `Row.get_def(field: str, default: str) -> str`
 - `Row.many(field: str) -> list[str]`
@@ -40,6 +41,12 @@ Start
 
 `Row.get()` returns `None` when a field has no capture. A field that
 captures an empty string returns `""`.
+
+`CompiledTemplate.schema()` returns one `FieldSchema` per `Value`, in
+template order. `FieldSchema.is_list` is `True` for `Value List` values
+and `False` for normal values. `FieldSchema.record_fields` contains nested
+named capture groups for `Value List`, which are exposed on parsed rows
+through `Row.many_records()`.
 
 ## Exceptions
 

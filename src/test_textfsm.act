@@ -239,6 +239,36 @@ Julia
     ])
     testing.assertEqual(rows[0].get_def("NAME", ""), "Julia")
 
+def _test_compiled_template_schema_describes_values():
+    template = r"""Value Required HOST (\S+)
+Value Filldown SITE (\S+)
+Value List NEIGHBOR ((?P<addr>\S+)\s+(?P<state>up|down))
+
+Start
+  ^Host:\s+${HOST}\s+${SITE} -> NoRecord
+  ^Neighbor:\s+${NEIGHBOR} -> Record
+"""
+    schema = compile_textfsm(template).schema()
+
+    testing.assertEqual(len(schema), 3)
+
+    testing.assertEqual(schema[0].name, "HOST")
+    testing.assertEqual(schema[0].regex, r"(\S+)")
+    testing.assertEqual(schema[0].is_list, False)
+    testing.assertEqual(schema[0].required, True)
+    testing.assertEqual(schema[0].filldown, False)
+    testing.assertEqual(schema[0].fillup, False)
+    testing.assertEqual(schema[0].record_fields, [])
+
+    testing.assertEqual(schema[1].name, "SITE")
+    testing.assertEqual(schema[1].is_list, False)
+    testing.assertEqual(schema[1].required, False)
+    testing.assertEqual(schema[1].filldown, True)
+
+    testing.assertEqual(schema[2].name, "NEIGHBOR")
+    testing.assertEqual(schema[2].is_list, True)
+    testing.assertEqual(schema[2].record_fields, ["addr", "state"])
+
 def _test_parse_dollar_name_substitution_and_escaped_dollar():
     template = r"""Value AMOUNT (\d+)
 
